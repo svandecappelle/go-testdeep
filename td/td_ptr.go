@@ -11,6 +11,7 @@ import (
 
 	"github.com/maxatome/go-testdeep/internal/color"
 	"github.com/maxatome/go-testdeep/internal/ctxerr"
+	"github.com/maxatome/go-testdeep/internal/dark"
 	"github.com/maxatome/go-testdeep/internal/types"
 )
 
@@ -54,7 +55,10 @@ func Ptr(val interface{}) TestDeep {
 		}
 		return &p
 	}
-	panic(color.BadUsage("Ptr(NON_NIL_VALUE)", val, 1, true))
+	f := dark.GetFatalizer()
+	f.Helper()
+	f.Fatal(color.BadUsage("Ptr(NON_NIL_VALUE)", val, 1, true))
+	return nil // never reached
 }
 
 func (p *tdPtr) Match(ctx ctxerr.Context, got reflect.Value) *ctxerr.Error {
@@ -145,7 +149,10 @@ func PPtr(val interface{}) TestDeep {
 		}
 		return &p
 	}
-	panic(color.BadUsage("PPtr(NON_NIL_VALUE)", val, 1, true))
+	f := dark.GetFatalizer()
+	f.Helper()
+	f.Fatal(color.BadUsage("PPtr(NON_NIL_VALUE)", val, 1, true))
+	return nil // never reached
 }
 
 func (p *tdPPtr) Match(ctx ctxerr.Context, got reflect.Value) *ctxerr.Error {

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/maxatome/go-testdeep/internal/color"
+	"github.com/maxatome/go-testdeep/internal/dark"
 	"github.com/maxatome/go-testdeep/internal/types"
 )
 
@@ -135,10 +136,12 @@ func NewT(t testing.TB, config ...ContextConfig) *T {
 
 	const usage = "NewT(testing.TB[, ContextConfig])"
 	if len(config) > 1 {
-		panic(color.TooManyParams(usage))
+		t.Fatal(color.TooManyParams(usage))
 	}
 	if t == nil {
-		panic(color.BadUsage(usage, nil, 1, false))
+		f := dark.GetFatalizer()
+		f.Helper()
+		f.Fatal(color.BadUsage(usage, nil, 1, false))
 	}
 
 	// Already a *T, so steal its testing.TB and its Config if needed
