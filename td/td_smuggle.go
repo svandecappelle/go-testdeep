@@ -1,4 +1,4 @@
-// Copyright (c) 2018, Maxime Soulé
+// Copyright (c) 2018-2021, Maxime Soulé
 // All rights reserved.
 //
 // This source code is licensed under the BSD-style license found in the
@@ -7,6 +7,7 @@
 package td
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/maxatome/go-testdeep/internal/color"
 	"github.com/maxatome/go-testdeep/internal/ctxerr"
 	"github.com/maxatome/go-testdeep/internal/types"
+	"strconv"
 )
 
 // SmuggledGot can be returned by a Smuggle function to name the
@@ -57,58 +59,192 @@ type smuggleValue struct {
 
 var smuggleValueType = reflect.TypeOf(smuggleValue{})
 
-func nilFieldErr(path []string) error {
-	return fmt.Errorf("field `%s' is nil", strings.Join(path, "."))
+type smuggleField struct {
+	Name    string
+	Indexed bool
 }
 
-func buildStructFieldFn(path string) (func(interface{}) (smuggleValue, error), error) {
-	parts := strings.Split(path, ".")
-
-	// Check path parts validity
-	for i, p := range parts {
-		for j, r := range p {
-			if !unicode.IsLetter(r) && (j == 0 || !unicode.IsNumber(r)) {
-				return nil, fmt.Errorf("bad field name `%s' in FIELDS_PATH", parts[i])
+func joinFieldPath(path []smuggleField) string {
+	var buf bytes.Buffer
+	for i, part := range path {
+		if part.Indexed {
+			fmt.Fprintf(&buf, "[%s]", part.Name)
+		} else {
+			if i > 0 {
+				buf.WriteByte('.')
 			}
+			buf.WriteString(part.Name)
 		}
+	}
+	return buf.String()
+}
+
+func splitFieldPath(origPath string) ([]smuggleField, error) {
+	if origPath == "" {
+		return nil, fmt.Errorf("FIELD_PATH cannot be empty")
+	}
+
+	var res []smuggleField
+	for path := origPath; len(path) > 0; {
+		r, _ := utf8.DecodeRuneInString(path)
+		switch r {
+		case '[':
+			path = path[1:]
+			end := strings.IndexByte(path, ']')
+			if end < 0 {
+				return nil, fmt.Errorf("cannot find final ']' in FIELD_PATH %q", origPath)
+			}
+			res = append(res, smuggleField{Name: path[:end], Indexed: true})
+			path = path[end+1:]
+
+		case '.':
+			path = path[1:]
+			r, _ = utf8.DecodeRuneInString(path)
+			fallthrough
+
+		default:
+			var field string
+			end := strings.IndexAny(path, ".[")
+			if end < 0 {
+				field, path = path, ""
+			} else {
+				field, path = path[:end], path[end:]
+			}
+
+			for j, r := range field {
+				if !unicode.IsLetter(r) && (j == 0 || !unicode.IsNumber(r)) {
+					return nil, fmt.Errorf("unexpected '%c' in field name %q in FIELDS_PATH %q", r, field, origPath)
+				}
+			}
+			res = append(res, smuggleField{Name: field})
+		}
+	}
+	return res, nil
+}
+
+func nilFieldErr(path []smuggleField) error {
+	return fmt.Errorf("field %q is nil", joinFieldPath(path))
+}
+
+func buildFieldPathFn(path string) (func(interface{}) (smuggleValue, error), error) {
+	parts, err := splitFieldPath(path)
+	if err != nil {
+		return nil, err
 	}
 
 	return func(got interface{}) (smuggleValue, error) {
 		vgot := reflect.ValueOf(got)
 
-		for idxPart, fieldName := range parts {
-			// Resolve only one interface{} dereference
-			if vgot.Kind() == reflect.Interface {
-				if vgot.IsNil() {
-					return smuggleValue{}, nilFieldErr(parts[:idxPart])
-				}
-				vgot = vgot.Elem()
-			}
-
-			// Resolve multiple ptr dereferences
+		for idxPart, field := range parts {
+			// Resolve all interface and pointer dereferences
 			for {
-				if vgot.Kind() != reflect.Ptr {
-					break
+				switch vgot.Kind() {
+				case reflect.Interface, reflect.Ptr:
+					if vgot.IsNil() {
+						return smuggleValue{}, nilFieldErr(parts[:idxPart])
+					}
+					vgot = vgot.Elem()
+					continue
 				}
-				if vgot.IsNil() {
-					return smuggleValue{}, nilFieldErr(parts[:idxPart])
-				}
-				vgot = vgot.Elem()
+				break
 			}
 
-			if vgot.Kind() != reflect.Struct {
+			if !field.Indexed {
+				if vgot.Kind() == reflect.Struct {
+					vgot = vgot.FieldByName(field.Name)
+					if !vgot.IsValid() {
+						return smuggleValue{}, fmt.Errorf(
+							"field %q not found",
+							joinFieldPath(parts[:idxPart+1]))
+					}
+					continue
+				}
 				if idxPart == 0 {
-					return smuggleValue{}, fmt.Errorf("it is not a struct and should be")
+					return smuggleValue{},
+						fmt.Errorf("it is a %s and should be a struct", vgot.Kind())
 				}
 				return smuggleValue{}, fmt.Errorf(
-					"field `%s' is not a struct and should be",
-					strings.Join(parts[:idxPart], "."))
+					"field %q is a %s and should be a struct",
+					joinFieldPath(parts[:idxPart]), vgot.Kind())
+
 			}
 
-			vgot = vgot.FieldByName(fieldName)
-			if !vgot.IsValid() {
-				return smuggleValue{}, fmt.Errorf("field `%s' not found",
-					strings.Join(parts[:idxPart+1], "."))
+			switch vgot.Kind() {
+			case reflect.Map:
+				tkey := vgot.Type().Key()
+				var vkey reflect.Value
+				switch tkey.Kind() {
+				case reflect.String:
+					vkey = reflect.ValueOf(field.Name)
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					i, err := strconv.ParseInt(field.Name, 10, 64)
+					if err != nil {
+						return smuggleValue{}, fmt.Errorf(
+							"field %q, %q is not an integer and so cannot match %s map key type",
+							joinFieldPath(parts[:idxPart+1]), field.Name, tkey)
+					}
+					vkey = reflect.ValueOf(i).Convert(tkey)
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+					i, err := strconv.ParseUint(field.Name, 10, 64)
+					if err != nil {
+						return smuggleValue{}, fmt.Errorf(
+							"field %q, %q is not an unsigned integer and so cannot match %s map key type",
+							joinFieldPath(parts[:idxPart+1]), field.Name, tkey)
+					}
+					vkey = reflect.ValueOf(i).Convert(tkey)
+				case reflect.Float32, reflect.Float64:
+					f, err := strconv.ParseFloat(field.Name, 64)
+					if err != nil {
+						return smuggleValue{}, fmt.Errorf(
+							"field %q, %q is not a float and so cannot match %s map key type",
+							joinFieldPath(parts[:idxPart+1]), field.Name, tkey)
+					}
+					vkey = reflect.ValueOf(f).Convert(tkey)
+				case reflect.Complex64, reflect.Complex128:
+					f, err := strconv.ParseComplex(field.Name, 128)
+					if err != nil {
+						return smuggleValue{}, fmt.Errorf(
+							"field %q, %q is not a complex number and so cannot match %s map key type",
+							joinFieldPath(parts[:idxPart+1]), field.Name, tkey)
+					}
+					vkey = reflect.ValueOf(f).Convert(tkey)
+				default:
+					return smuggleValue{}, fmt.Errorf(
+						"field %q, %q cannot match unsupported %s map key type",
+						joinFieldPath(parts[:idxPart+1]), field.Name, tkey)
+				}
+				vgot = vgot.MapIndex(vkey)
+				if !vgot.IsValid() {
+					return smuggleValue{}, fmt.Errorf("field %q, %q map key not found",
+						joinFieldPath(parts[:idxPart+1]), field.Name)
+				}
+
+			case reflect.Slice, reflect.Array:
+				i, err := strconv.ParseInt(field.Name, 10, 64)
+				if err != nil {
+					return smuggleValue{}, fmt.Errorf(
+						"field %q, %q is not a slice/array index",
+						joinFieldPath(parts[:idxPart+1]), field.Name)
+				}
+				if i < 0 {
+					i = int64(vgot.Len()) + i
+				}
+				if i < 0 || i >= int64(vgot.Len()) {
+					return smuggleValue{}, fmt.Errorf(
+						"field %q, %d is out of slice/array range (len %d)",
+						joinFieldPath(parts[:idxPart+1]), i, vgot.Len())
+				}
+				vgot = vgot.Index(int(i))
+
+			default:
+				if idxPart == 0 {
+					return smuggleValue{},
+						fmt.Errorf("it is a %s, but a map, array or slice is expected",
+							vgot.Kind())
+				}
+				return smuggleValue{}, fmt.Errorf(
+					"field %q is a %s, but a map, array or slice is expected",
+					joinFieldPath(parts[:idxPart]), vgot.Kind())
 			}
 		}
 		return smuggleValue{
@@ -300,7 +436,7 @@ func Smuggle(fn, expectedValue interface{}) TestDeep {
 
 	switch vfn.Kind() {
 	case reflect.String:
-		fn, err := buildStructFieldFn(vfn.String())
+		fn, err := buildFieldPathFn(vfn.String())
 		if err != nil {
 			panic(color.Bad("%s: %s", usage, err))
 		}
